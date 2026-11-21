@@ -1,230 +1,272 @@
-"""ADA Insight | educational real-data analytics dashboard."""
+"""ADA Insight 2.0 – robust Streamlit Cloud educational dashboard."""
+from __future__ import annotations
 import json
+import math
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from analytics import indicators, technical_score, integral_score, explain, change_pct
+from analytics import indicators, technical_score, integral_score, explain, change_pct, onchain_score
 from sources import market_data, defi_data, blockfrost_stats, news, sentiment
 
-DB = Path(__file__).with_name('ada_insight.sqlite3')
+st.set_page_config(page_title='ADA Insight · Cardano', page_icon='🔷', layout='wide', initial_sidebar_state='expanded')
+st.markdown('''<style>
+.block-container {max-width:1280px;padding-top:1.2rem;}
+[data-testid="stMetric"] {background:rgba(115,125,160,.08);padding:14px;border-radius:14px;border:1px solid rgba(130,140,165,.19);}
+[data-testid="stSidebar"] {border-right:1px solid rgba(135,145,165,.18);}
+</style>''',unsafe_allow_html=True)
 
-@st.cache_data(ttl=900, show_spinner=False)
-def cached_market(days): return market_data(days)
+DB=Path(__file__).with_name('ada_insight.sqlite3')
+def num(value):
+    try:
+        if value is None: return None
+        n=float(value)
+        return n if math.isfinite(n) else None
+    except (TypeError,ValueError,OverflowError): return None
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def cached_defi(): return defi_data()
+def money(v,decimals=0):
+    n=num(v)
+    return f'${n:,.{decimals}f}' if n is not None else 'Нет данных'
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def cached_onchain(): return blockfrost_stats()
+def quantity(v,decimals=0):
+    n=num(v)
+    return f'{n:,.{decimals}f}' if n is not None else 'Нет данных'
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def cached_news(): return news()
+@st.cache_data(ttl=900,show_spinner=False)
+def load_market(days): return market_data(days)
+@st.cache_data(ttl=1800,show_spinner=False)
+def load_defi(): return defi_data()
+@st.cache_data(ttl=1800,show_spinner=False)
+def load_chain(key): return blockfrost_stats(key=key)
+@st.cache_data(ttl=1800,show_spinner=False)
+def load_news(): return news()
 
+def load_data(days,key):
+    results={'frame':None,'detail':None,'defi':None,'epochs':None,'articles':[],'issues':[],'loaded_at':datetime.now(timezone.utc).isoformat(),'days':days}
+    try:
+        results['frame'],results['detail'],warning=load_market(days)
+        if warning: results['issues'].append(warning)
+    except Exception as exc: results['issues'].append(f'CoinGecko: {type(exc).__name__}: {exc}')
+    try: results['defi']=load_defi()
+    except Exception as exc: results['issues'].append(f'DefiLlama: {type(exc).__name__}: {exc}')
+    try:
+        results['epochs'],warning=load_chain(key)
+        if warning: results['issues'].append(warning)
+    except Exception as exc: results['issues'].append(f'Blockfrost: {type(exc).__name__}: {exc}')
+    try: results['articles']=load_news()
+    except Exception as exc: results['issues'].append(f'Google News: {type(exc).__name__}: {exc}')
+    return results
 
 def init_db():
-    with sqlite3.connect(DB) as conn:
-        conn.execute('CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, run_at TEXT NOT NULL, days INTEGER NOT NULL, data TEXT NOT NULL)')
-        conn.commit()
+    try:
+        with sqlite3.connect(DB,timeout=5) as conn:
+            conn.execute('CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, run_at TEXT NOT NULL, period INTEGER NOT NULL, payload TEXT NOT NULL)')
+        return None
+    except Exception as exc:
+        return f'SQLite недоступна: {type(exc).__name__}: {exc}'
 
-
-def save_run(days, payload):
-    with sqlite3.connect(DB) as conn:
-        conn.execute('INSERT INTO runs(run_at,days,data) VALUES(?,?,?)', (datetime.now(timezone.utc).isoformat(), days, json.dumps(payload, ensure_ascii=False)))
-        conn.commit()
-
+def save_run(days,payload):
+    with sqlite3.connect(DB,timeout=5) as conn:
+        conn.execute('INSERT INTO runs (run_at,period,payload) VALUES (?,?,?)',
+            (datetime.now(timezone.utc).isoformat(),int(days),json.dumps(payload,ensure_ascii=False)))
 
 def history():
-    with sqlite3.connect(DB) as conn:
-        return pd.read_sql_query('SELECT * FROM runs ORDER BY id DESC LIMIT 100', conn)
+    with sqlite3.connect(DB,timeout=5) as conn:
+        return pd.read_sql_query('SELECT * FROM runs ORDER BY id DESC LIMIT 100',conn)
 
-
-def fmt_money(val, decimals=4):
-    return f'${val:,.{decimals}f}' if val is not None else 'Нет данных'
-
-st.set_page_config(page_title='ADA Insight | Cardano', page_icon='🔷', layout='wide')
-st.markdown('''<style>
-.block-container {padding-top: 1.4rem; max-width: 1450px;}
-[data-testid="stMetric"] {border:1px solid #33415c; border-radius:14px; padding:13px;}
-h1,h2,h3 {letter-spacing:-.02em;}
-</style>''', unsafe_allow_html=True)
-init_db()
 st.title('🔷 ADA Insight')
-st.caption('Cardano (ADA/USD) · Интеллектуальная аналитическая система · Учебный проект')
-
+st.caption('Cardano (ADA/USD) · Технический, фундаментальный, ончейн-анализ и анализ настроений')
+db_error=init_db()
 with st.sidebar:
-    st.header('Настройки анализа')
-    st.info('Актив: Cardano (ADA). Источники: CoinGecko, DefiLlama, Blockfrost, Google News RSS.')
-    days = st.selectbox('Период ценового анализа', [30, 90, 180, 365], index=1, format_func=lambda x: f'{x} дней')
-    st.caption('Бесплатные API могут ограничивать историю и частоту обращений.')
-    if st.button('🔄 Обновить и пересчитать', type='primary', use_container_width=True):
-        cached_market.clear(); cached_defi.clear(); cached_onchain.clear(); cached_news.clear()
-        st.rerun()
+    st.header('⚙️ Настройки')
+    days=st.selectbox('Период истории цены',[30,90,180,365],index=2,format_func=lambda d:f'{d} дней')
+    key=''
+    try: key=str(st.secrets.get('BLOCKFROST_PROJECT_ID','') or '').strip()
+    except Exception: pass
+    key=key or os.getenv('BLOCKFROST_PROJECT_ID','').strip()
+    with st.expander('Ключ Blockfrost (необязательно)'):
+        manual=st.text_input('Project ID',value='',type='password',help='Для личной проверки. Для опубликованного сайта лучше Streamlit → Settings → Secrets.')
+        if manual: key=manual.strip()
+        st.caption('Не записывайте секретные ключи в GitHub.')
+    refresh=st.button('🔄 Загрузить / пересчитать',type='primary',use_container_width=True)
+    if st.button('Очистить кэш данных',use_container_width=True):
+        st.cache_data.clear()
+        st.info('Кэш очищен. Теперь нажмите «Загрузить / пересчитать».')
+    st.caption('Источник цены — CoinGecko; DeFi — DefiLlama; сеть — Blockfrost; новости — Google News.')
+    st.caption('Учебная аналитика, не инвестиционная рекомендация.')
 
-issues = []
-price = detail = defi = onchain = articles = None
-with st.spinner('Получаем доступные данные из независимых источников…'):
-    try: price, detail = cached_market(days)
-    except Exception as exc: issues.append(f'CoinGecko: {exc}')
-    try: defi = cached_defi()
-    except Exception as exc: issues.append(f'DefiLlama: {exc}')
-    try:
-        onchain, warning = cached_onchain()
-        if warning: issues.append(warning)
-    except Exception as exc: issues.append(f'Blockfrost: {exc}')
-    try: articles = cached_news()
-    except Exception as exc: issues.append(f'Google News: {exc}')
+if refresh:
+    with st.spinner('Получаем данные из внешних API. Если источник недоступен, остальные разделы продолжат работать…'):
+        st.session_state['ada_analysis']=load_data(days,key)
+        st.session_state['ada_key_present']=bool(key)
 
-frame = indicators(price) if price is not None and len(price) > 0 else None
-ta, ta_signals = technical_score(frame) if frame is not None else (None, ['Нет рыночных данных.'])
+if 'ada_analysis' not in st.session_state:
+    st.info('👋 Сайт успешно запущен! Нажмите **«🔄 Загрузить / пересчитать»** слева, чтобы получить реальные данные Cardano. Без ключа Blockfrost ончейн-оценка будет недоступна.')
+    st.subheader('Модули аналитической системы')
+    a,b,c,d=st.columns(4)
+    a.info('📈 **Технический**\n\nRSI · MACD · EMA · SMA')
+    b.info('🏛️ **Фундаментальный**\n\nРыночная оценка · токеномика')
+    c.info('🔗 **Ончейн**\n\nТранзакции · комиссии · стейкинг')
+    d.info('💬 **Настроения**\n\nПубликации · тональность')
+    st.stop()
 
-# Explicit scoring rubric. No score is invented if required input is absent.
-fa = None
-fa_factors = []
-if detail is not None and defi is not None:
-    market = detail.get('market_data') or {}
-    cap = (market.get('market_cap') or {}).get('usd')
-    fdv = (market.get('fully_diluted_valuation') or {}).get('usd')
-    circ = market.get('circulating_supply')
-    maxs = market.get('max_supply')
-    tvl = defi.get('tvl')
-    factors = []
-    if cap and fdv:
-        factors.append(25 if cap/fdv >= .75 else -25)
-        fa_factors.append(f'Market Cap / FDV = {cap/fdv:.2f}; отражает потенциальное размытие.')
-    if circ and maxs:
-        factors.append(25 if circ/maxs >= .75 else -25)
-        fa_factors.append(f'Циркулирующее предложение / максимум = {circ/maxs:.1%}.')
-    if cap and tvl is not None:
-        factors.append(25 if tvl/cap >= .05 else -25)
-        fa_factors.append(f'TVL экосистемы / капитализация = {tvl/cap:.2%}; эвристический порог 5%.')
-    if len(factors) == 3: fa = sum(factors) / len(factors) * 4
-    else: fa_factors.append('Для количественной оценки недостаточно обязательных метрик.')
+raw=st.session_state['ada_analysis']
+frame=raw.get('frame'); detail=raw.get('detail'); defi=raw.get('defi'); epochs=raw.get('epochs'); articles=raw.get('articles') or []
+issues=list(raw.get('issues') or [])
+if frame is not None and not frame.empty:
+    frame=indicators(frame)
+    ta,ta_factors=technical_score(frame)
+else:
+    frame=None; ta=None; ta_factors=['Нет исторических рыночных данных.']
 
-on = None
-on_factors = []
-if onchain:
-    # Single snapshot is not evidence of growth or decline: require historical comparisons.
-    on_factors.append('Blockfrost предоставляет снимок эпохи; для оценки тренда нужны минимум две сопоставимые эпохи.')
+market=(detail or {}).get('market_data') or {}
+cap=num((market.get('market_cap') or {}).get('usd'))
+fdv=num((market.get('fully_diluted_valuation') or {}).get('usd'))
+circ=num(market.get('circulating_supply'))
+max_supply=num(market.get('max_supply'))
+tvl=num((defi or {}).get('tvl'))
+fa_factors=[]; criteria=[]
+if cap and fdv and fdv>0:
+    ratio=cap/fdv; criteria.append(1 if ratio>=.75 else -1)
+    fa_factors.append(f'Market Cap / FDV = {ratio:.2f}; критерий: ≥ 0,75.')
+if circ is not None and max_supply and max_supply>0:
+    ratio=circ/max_supply; criteria.append(1 if ratio>=.75 else -1)
+    fa_factors.append(f'Циркулирует {ratio:.1%} максимального предложения; критерий: ≥ 75%.')
+if cap and tvl is not None:
+    ratio=tvl/cap; criteria.append(1 if ratio>=.05 else -1)
+    fa_factors.append(f'TVL / капитализация = {ratio:.2%}; учебный критерий: ≥ 5%.')
+fa=round(100*sum(criteria)/3,1) if len(criteria)==3 else None
+if fa is None: fa_factors.append('Для фундаментального балла необходимы все три сравнения.')
 
-sa = None
-news_df = None
-if articles:
-    news_df = pd.DataFrame(articles)
-    news_df['sentiment'] = news_df['title'].map(sentiment)
-    if len(news_df) >= 30:
-        sa = round(float(news_df['sentiment'].mean()*100), 1)
+chain_df=pd.DataFrame(epochs) if epochs else None
+on,on_factors=onchain_score(chain_df)
 
-scores = {'TA': ta, 'FA': fa, 'ON': on, 'SA': sa}
-combined, coverage, conflicts = integral_score(scores)
+news_df=pd.DataFrame(articles) if articles else None
+sa=None
+if news_df is not None:
+    news_df['sentiment']=news_df['title'].map(sentiment)
+    if len(news_df)>=30: sa=round(float(news_df['sentiment'].mean())*100,1)
 
-st.subheader('Главная панель')
-last_price = float(frame['close'].iloc[-1]) if frame is not None else None
-prev_price = float(frame['close'].iloc[-2]) if frame is not None and len(frame)>1 else None
-change = change_pct(last_price,prev_price) if last_price is not None and prev_price is not None else None
-c1,c2,c3,c4 = st.columns(4)
-c1.metric('ADA/USD', fmt_money(last_price), f'{change:+.2f}% / день' if change is not None else None)
-c2.metric('Интегральная оценка', f'{combined:+.1f}' if combined is not None else 'Недоступна')
-c3.metric('Полнота данных для оценки', f'{coverage:.0f}%')
-c4.metric('Дата анализа', datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M UTC'))
-st.caption('Полнота данных — доля доступных модулей с учётом весов, НЕ оценка точности прогноза. Оценки и пороги являются учебными эвристиками.')
+scores={'TA':ta,'FA':fa,'ON':on,'SA':sa}
+combined,coverage,conflicts=integral_score(scores)
+last=num(frame['close'].iloc[-1]) if frame is not None else None
+prev=num(frame['close'].iloc[-2]) if frame is not None and len(frame)>1 else None
+change=change_pct(last,prev) if last is not None and prev is not None else None
+
+st.subheader('📌 Главная панель')
+c1,c2,c3,c4=st.columns(4)
+c1.metric('ADA / USD',money(last,4),f'{change:+.2f}% / день' if change is not None else None)
+c2.metric('Интегральная оценка',f'{combined:+.1f}' if combined is not None else 'Недоступна')
+c3.metric('Полнота оценочных данных',f'{coverage:.0f}%')
+c4.metric('Обновлено (UTC)',str(raw.get('loaded_at',''))[:16].replace('T',' '))
+st.caption('Полнота — сумма весов модулей с рассчитанными баллами, НЕ вероятность верного прогноза. Для интегральной оценки нужны все 4 модуля.')
 if issues:
-    with st.expander(f'⚠️ Ограничения источников ({len(issues)})', expanded=True):
+    with st.expander(f'⚠️ Ограничения / ошибки источников ({len(issues)})',expanded=True):
         for issue in issues: st.warning(issue)
+if db_error: st.warning(db_error)
 
-technical, fundamental, chain, moods, summary, archive = st.tabs(['📈 Технический', '🏛️ Фундаментальный', '🔗 Ончейн', '💬 Настроения', '🎯 Комплексная оценка', '🗄️ История'])
-with technical:
+t1,t2,t3,t4,t5,t6=st.tabs(['📈 Технический','🏛️ Фундаментальный','🔗 Ончейн','💬 Настроения','🎯 Комплексная оценка','🗄️ История'])
+with t1:
     st.header('Технический анализ')
-    if frame is None: st.error('Нет данных для построения графика.')
+    if frame is None: st.error('История ADA недоступна. Проверьте ответ CoinGecko и повторите загрузку.')
     else:
-        st.write('Цены и скользящие средние')
-        fig = go.Figure()
-        for name in ['close','SMA20','SMA50','BB_upper','BB_lower']:
-            fig.add_trace(go.Scatter(x=frame['date'],y=frame[name],mode='lines',name=name))
-        fig.update_layout(height=420, xaxis_title='Дата', yaxis_title='USD', legend_orientation='h')
-        st.plotly_chart(fig, use_container_width=True)
-        f2 = go.Figure()
-        f2.add_trace(go.Scatter(x=frame['date'],y=frame['RSI14'],name='RSI14'))
-        f2.add_hline(y=70,line_dash='dash'); f2.add_hline(y=30,line_dash='dash')
-        f2.update_layout(height=260,yaxis_title='RSI')
-        st.plotly_chart(f2, use_container_width=True)
-        f3 = go.Figure()
-        f3.add_trace(go.Scatter(x=frame['date'], y=frame['MACD'],name='MACD'))
-        f3.add_trace(go.Scatter(x=frame['date'],y=frame['MACD_signal'],name='Signal'))
-        f3.update_layout(height=260)
-        st.plotly_chart(f3, use_container_width=True)
-        st.metric('Технический балл (-100…100)', ta if ta is not None else 'Нет данных')
-        for x in ta_signals: st.write('•',x)
-        st.download_button('Скачать обработанные цены (CSV)',frame.to_csv(index=False).encode('utf-8-sig'),'ada_indicators.csv','text/csv')
-        st.dataframe(frame.tail(40).sort_values('date',ascending=False),use_container_width=True)
-with fundamental:
-    st.header('Фундаментальный анализ')
-    st.write('ADA используется для комиссий и стейкинга в сети Cardano; оценка ниже основана только на числовых источниках, без субъективных оценок технологии.')
-    if detail:
-        m = detail.get('market_data') or {}
-        cols = st.columns(3)
-        cols[0].metric('Market Cap, USD', f"${(m.get('market_cap') or {}).get('usd',0):,.0f}")
-        cols[1].metric('FDV, USD', f"${(m.get('fully_diluted_valuation') or {}).get('usd',0):,.0f}")
-        cols[2].metric('Предложение ADA',f"{m.get('circulating_supply') or 0:,.0f}")
-        st.write('Максимальное предложение:',m.get('max_supply'))
-    if defi: st.metric('Cardano DeFi TVL',f"${defi.get('tvl',0):,.0f}")
-    st.metric('Фундаментальный балл (-100…100)',f'{fa:+.1f}' if fa is not None else 'Недостаточно данных')
-    for x in fa_factors: st.write('•',x)
-    st.caption('Пороговые значения заданы разработчиком для демонстрации, не являются общепринятым инвестиционным стандартом.')
-with chain:
-    st.header('Ончейн-анализ')
-    if onchain:
-        st.write('Источник: Blockfrost, сеть Cardano mainnet.')
-        cols = st.columns(3)
-        cols[0].metric('Номер эпохи',onchain.get('epoch') or '—')
-        cols[1].metric('Транзакции за эпоху',onchain.get('epoch_tx_count') or '—')
-        fees = onchain.get('epoch_fees_lovelace')
-        cols[2].metric('Комиссии за эпоху (ADA)', f'{int(fees)/1e6:,.0f}' if fees else '—')
-        stake = onchain.get('epoch_active_stake_lovelace')
-        st.write('Активный стейк (ADA):',f'{int(stake)/1e6:,.0f}' if stake else 'Нет данных')
-        st.json(onchain)
-    else: st.info('Для этого раздела нужен бесплатный ключ Blockfrost. Добавьте BLOCKFROST_PROJECT_ID.')
-    for x in on_factors: st.info(x)
-    st.warning('Ончейн-балл не рассчитывается по одному снимку: отсутствует историческая динамика. Это честно снижает полноту анализа.')
-with moods:
-    st.header('Анализ информационного фона')
-    if news_df is None: st.warning('Не удалось получить публикации Cardano.')
-    else:
-        st.metric('Публикаций Cardano',len(news_df))
-        counts = news_df['sentiment'].value_counts()
-        labels = {-1:'Негативные',0:'Нейтральные',1:'Позитивные'}
-        fig = go.Figure(go.Bar(x=[labels[k] for k in [-1,0,1]],y=[int(counts.get(k,0)) for k in [-1,0,1]]))
+        fig=go.Figure()
+        for col in ['close','SMA20','SMA50','BB_upper','BB_lower']:
+            fig.add_trace(go.Scatter(x=frame['date'],y=frame[col],mode='lines',name=col))
+        fig.update_layout(height=390,xaxis_title='Дата',yaxis_title='USD',legend_orientation='h')
         st.plotly_chart(fig,use_container_width=True)
-        st.metric('Индекс настроений (-100…100)',f'{sa:+.1f}' if sa is not None else 'Недостаточно публикаций (<30)')
-        st.caption('Прозрачная словарная классификация английских заголовков. Не распознаёт надёжно сарказм и контекст. Рекомендуется ручная проверка не менее 20% материалов.')
-        st.dataframe(news_df,use_container_width=True, column_config={'url':st.column_config.LinkColumn('Источник')})
-        st.download_button('Скачать публикации (CSV)',news_df.to_csv(index=False).encode('utf-8-sig'),'ada_news.csv','text/csv')
-with summary:
-    st.header('Комплексная оценка Cardano')
-    scores_df = pd.DataFrame([{'Модуль':name,'Балл':score,'Вес':w} for name,score,w in [('TA',ta,.30),('FA',fa,.25),('ON',on,.25),('SA',sa,.20)]])
-    st.dataframe(scores_df,use_container_width=True,hide_index=True)
-    st.write('**Формула:** S = 0,30·TA + 0,25·FA + 0,25·ON + 0,20·SA')
-    st.subheader(explain(combined))
-    st.write('Интегральный балл:',combined if combined is not None else 'Не формируется при отсутствии одного или нескольких модулей')
-    st.write('Полнота:',f'{coverage:.0f}%')
-    if conflicts:
-        for x in conflicts: st.warning('Противоречие: '+x)
-    else: st.info('Среди модулей с доступными баллами выраженных конфликтов нет.')
-    st.caption('Это аналитический учебный инструмент, не инвестиционная рекомендация.')
-    if st.button('💾 Сохранить этот расчёт в историю'):
-        save_run(days, {'scores':scores,'integral':combined,'coverage':coverage,'issues':issues,'conflicts':conflicts,'price':last_price,'date':str(frame['date'].iloc[-1]) if frame is not None else None})
-        st.success('Расчёт сохранён в SQLite.')
-with archive:
-    st.header('История анализа')
-    rows = history()
-    if rows.empty: st.info('История пока пуста. Нажмите «Сохранить этот расчёт» в разделе комплексной оценки.')
+        f2=go.Figure(); f2.add_trace(go.Scatter(x=frame['date'],y=frame['RSI14'],name='RSI14'))
+        f2.add_hline(y=70,line_dash='dash'); f2.add_hline(y=30,line_dash='dash')
+        f2.update_layout(height=240)
+        st.plotly_chart(f2,use_container_width=True)
+        f3=go.Figure()
+        for name in ['MACD','MACD_signal']:
+            f3.add_trace(go.Scatter(x=frame['date'],y=frame[name],name=name))
+        f3.update_layout(height=240)
+        st.plotly_chart(f3,use_container_width=True)
+        if 'volume' in frame:
+            f4=go.Figure(go.Bar(x=frame['date'],y=frame['volume'],name='Объём'))
+            f4.update_layout(height=230)
+            st.plotly_chart(f4,use_container_width=True)
+        st.metric('Технический балл',f'{ta:+.1f}' if ta is not None else 'Нет данных')
+        for note in ta_factors: st.write('•',note)
+        st.dataframe(frame.tail(30).sort_values('date',ascending=False),use_container_width=True)
+        st.download_button('Скачать индикаторы CSV',frame.to_csv(index=False).encode('utf-8-sig'),'cardano_indicators.csv','text/csv')
+with t2:
+    st.header('Фундаментальный анализ')
+    a,b,c=st.columns(3)
+    a.metric('Капитализация',money(cap)); b.metric('FDV',money(fdv)); c.metric('DeFi TVL',money(tvl))
+    d,e=st.columns(2)
+    d.metric('Циркулирующее предложение',quantity(circ)); e.metric('Максимальное предложение',quantity(max_supply))
+    st.metric('Фундаментальный балл',f'{fa:+.1f}' if fa is not None else 'Недостаточно данных')
+    for note in fa_factors: st.write('•',note)
+    st.caption('Три числовых критерия являются прозрачными учебными эвристиками, а не доказанной оценкой стоимости ADA.')
+    with st.expander('Сырые данные CoinGecko и DefiLlama'):
+        if detail: st.json({'market_data':market})
+        if defi: st.json(defi)
+with t3:
+    st.header('Ончейн-анализ Cardano')
+    if chain_df is None or chain_df.empty:
+        st.info('Нет исторических эпох Cardano. Создайте Project ID Cardano mainnet на Blockfrost и добавьте его в Streamlit Secrets.')
     else:
-        parsed = rows.copy(); parsed['data']=parsed['data'].apply(json.loads)
-        parsed['integral']=parsed['data'].apply(lambda x:x.get('integral'))
-        parsed['coverage']=parsed['data'].apply(lambda x:x.get('coverage'))
-        parsed['price']=parsed['data'].apply(lambda x:x.get('price'))
-        st.dataframe(parsed.drop(columns=['data']),use_container_width=True)
-        st.download_button('Экспорт истории (CSV)',parsed.drop(columns=['data']).to_csv(index=False).encode('utf-8-sig'),'history.csv','text/csv')
+        st.caption('Последние завершённые эпохи; текущая незавершённая эпоха исключена.')
+        st.dataframe(chain_df.sort_values('epoch',ascending=False),use_container_width=True)
+        for col,name in [('tx_count','Транзакции'),('fees_ada','Комиссии (ADA)'),('active_stake_ada','Активный стейк (ADA)')]:
+            if col in chain_df:
+                fig=go.Figure(go.Scatter(x=chain_df['epoch'],y=chain_df[col],mode='lines+markers',name=name))
+                fig.update_layout(height=230,xaxis_title='Эпоха',yaxis_title=name)
+                st.plotly_chart(fig,use_container_width=True)
+        st.download_button('Скачать эпохи CSV',chain_df.to_csv(index=False).encode('utf-8-sig'),'cardano_epochs.csv','text/csv')
+    st.metric('Ончейн-балл',f'{on:+.1f}' if on is not None else 'Недостаточно данных')
+    for note in on_factors: st.write('•',note)
+    st.caption('Баллы основаны на направлении изменений трёх метрик, не измеряют безопасность сети или цену токена.')
+with t4:
+    st.header('Анализ настроений о Cardano')
+    if news_df is None or news_df.empty: st.warning('Публикации не получены.')
+    else:
+        st.metric('Получено публикаций',len(news_df))
+        counts=news_df['sentiment'].value_counts()
+        fig=go.Figure(go.Bar(x=['Негативные','Нейтральные','Позитивные'],y=[int(counts.get(v,0)) for v in [-1,0,1]]))
+        st.plotly_chart(fig,use_container_width=True)
+        if 'published' in news_df:
+            tmp=news_df.copy();tmp['date']=pd.to_datetime(tmp['published'],errors='coerce',utc=True).dt.date
+            daily=tmp.dropna(subset=['date']).groupby('date')['sentiment'].mean().reset_index()
+            if not daily.empty:
+                st.plotly_chart(go.Figure(go.Scatter(x=daily['date'],y=daily['sentiment'],mode='lines+markers',name='Средняя тональность')),use_container_width=True)
+        st.metric('Индекс настроений',f'{sa:+.1f}' if sa is not None else 'Нужно ≥ 30 публикаций')
+        st.dataframe(news_df,use_container_width=True)
+        st.download_button('Скачать новости CSV',news_df.to_csv(index=False).encode('utf-8-sig'),'cardano_news.csv','text/csv')
+        st.caption('Классификация словарная, по английским заголовкам; сарказм и отрицания могут классифицироваться неверно.')
+with t5:
+    st.header('Комплексная аналитическая оценка')
+    st.dataframe(pd.DataFrame([{'Модуль':k,'Балл':v,'Вес':w} for k,v,w in [('TA',ta,.30),('FA',fa,.25),('ON',on,.25),('SA',sa,.20)]]),hide_index=True,use_container_width=True)
+    st.write('**S = 0,30 × TA + 0,25 × FA + 0,25 × ON + 0,20 × SA**')
+    st.subheader(explain(combined))
+    st.write('Интегральный балл:',combined if combined is not None else 'Недостаточно данных — вывод не формируется')
+    st.write('Полнота модулей:',f'{coverage:.0f}%')
+    if conflicts:
+        for c in conflicts: st.warning('Противоречие: '+c)
+    else: st.info('Среди оценённых модулей резких противоположных сигналов не выявлено.')
+    st.caption('Интерпретации и веса учебные. Полученный балл — не прогноз доходности.')
+    if st.button('💾 Сохранить расчёт в историю'):
+        if db_error: st.error(db_error)
+        else:
+            try:
+                save_run(raw['days'],{'scores':scores,'integral':combined,'coverage':coverage,'price':last,'issues':issues,'at':raw['loaded_at']})
+                st.success('Результат сохранён.')
+            except Exception as exc: st.error(f'Не удалось сохранить: {exc}')
+with t6:
+    st.header('История анализа')
+    st.caption('SQLite находится на сервере Streamlit и может сбрасываться при перезапуске/пересборке приложения. Для постоянного архива потребуется внешняя БД.')
+    if db_error: st.error(db_error)
+    else:
+        try:
+            rows=history()
+            if rows.empty: st.info('История пока пуста. Сохраните расчёт на вкладке «Комплексная оценка».')
+            else:
+                st.dataframe(rows,use_container_width=True)
+                st.download_button('Скачать историю CSV',rows.to_csv(index=False).encode('utf-8-sig'),'ada_history.csv','text/csv')
+        except Exception as exc: st.error(f'Не удалось прочитать историю: {exc}')

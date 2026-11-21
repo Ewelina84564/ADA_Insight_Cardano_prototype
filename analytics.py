@@ -76,3 +76,25 @@ def explain(score: float | None) -> str:
     if score > -10: return 'Нейтральное состояние'
     if score > -30: return 'Умеренно отрицательная оценка'
     return 'Преимущественно отрицательные сигналы'
+
+
+def onchain_score(epochs: pd.DataFrame) -> tuple[float | None, list[str]]:
+    """Compare averages of recent 3 and previous 3 FINISHED epochs.
+    Missing metric does not become neutral signal. Returns unavailable if less than 6 epochs.
+    """
+    if epochs is None or len(epochs) < 6:
+        return None, ['Для сравнения требуется не менее 6 завершённых эпох Cardano.']
+    df = epochs.sort_values('epoch').tail(6)
+    factors = []
+    explanations = []
+    for col, label in [('tx_count','Число транзакций'),('fees_ada','Сетевые комиссии'),('active_stake_ada','Активный стейк')]:
+        if col not in df: continue
+        vals = pd.to_numeric(df[col], errors='coerce')
+        before, after = vals.iloc[:3].mean(), vals.iloc[3:].mean()
+        if not (np.isfinite(before) and np.isfinite(after) and before > 0): continue
+        change = (after / before - 1) * 100
+        factors.append(1 if change > 3 else -1 if change < -3 else 0)
+        explanations.append(f'{label}: {change:+.1f}% (3 последние эпохи против 3 предыдущих; порог ±3%).')
+    if len(factors) < 3:
+        return None, explanations + ['Недостаточно трёх сопоставимых ончейн-показателей.']
+    return round(100*sum(factors)/len(factors),1), explanations
